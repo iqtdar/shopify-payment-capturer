@@ -1,3 +1,6 @@
+// FIX: Must load .env before any other require that reads process.env
+require('dotenv').config();
+
 const express = require('express');
 const bodyParser = require('body-parser');
 const cors = require('cors');
@@ -17,6 +20,7 @@ try {
   console.log('✅ Shopify service initialized');
 } catch (error) {
   console.error('❌ Failed to initialize Shopify service:', error.message);
+  process.exit(1); // Can't run without a valid config
 }
 
 // Health check endpoint
@@ -27,7 +31,7 @@ app.get('/health', (req, res) => {
     shop: process.env.SHOPIFY_SHOP_NAME,
     uptime: process.uptime(),
     memory: process.memoryUsage(),
-    node: process.version
+    node: process.version,
   });
 });
 
@@ -96,12 +100,11 @@ app.get('/test/shop', async (req, res) => {
       shop: process.env.SHOPIFY_SHOP_NAME,
       connected: true,
       timestamp: new Date().toISOString(),
-      scopes: 'read_all_orders,write_orders'
     });
   } catch (error) {
-    res.status(500).json({ 
+    res.status(500).json({
       error: error.message,
-      connected: false 
+      connected: false,
     });
   }
 });
@@ -111,14 +114,14 @@ app.get('/test/orders', async (req, res) => {
     const orders = await shopifyService.getRecentOrders(5);
     res.json({
       count: orders.length,
-      orders: orders.map(order => ({
+      orders: orders.map((order) => ({
         id: order.id,
         name: order.name,
         financial_status: order.financial_status,
         note_attributes: order.note_attributes,
         tags: order.tags,
-        created_at: order.created_at
-      }))
+        created_at: order.created_at,
+      })),
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -130,22 +133,24 @@ app.get('/debug/order/:orderId', async (req, res) => {
   try {
     const orderId = req.params.orderId;
     console.log(`🔍 Debugging order: ${orderId}`);
-    
+
     const order = await shopifyService.getOrder(orderId);
     const transactions = await shopifyService.getOrderTransactions(orderId);
-    
+
     res.json({
       order_id: orderId,
       financial_status: order.financial_status,
       note_attributes: order.note_attributes,
       tags: order.tags,
-      line_items: order.line_items?.map(item => ({
+      line_items: order.line_items?.map((item) => ({
         name: item.name,
-        properties: item.properties
+        properties: item.properties,
       })),
       transactions: transactions,
-      has_authorization: transactions.some(t => t.kind === 'authorization'),
-      has_successful_auth: transactions.some(t => t.kind === 'authorization' && t.status === 'success')
+      has_authorization: transactions.some((t) => t.kind === 'authorization'),
+      has_successful_auth: transactions.some(
+        (t) => t.kind === 'authorization' && t.status === 'success'
+      ),
     });
   } catch (error) {
     console.error('Debug error:', error);
@@ -158,25 +163,28 @@ app.post('/debug/capture/:orderId', async (req, res) => {
   try {
     const orderId = req.params.orderId;
     console.log(`🔄 Manual capture for order: ${orderId}`);
-    
+
     const transactions = await shopifyService.getOrderTransactions(orderId);
-    const authTransaction = transactions.find(t => 
-      t.kind === 'authorization' && t.status === 'success'
+    const authTransaction = transactions.find(
+      (t) => t.kind === 'authorization' && t.status === 'success'
     );
-    
+
     if (!authTransaction) {
-      return res.status(400).json({ 
+      return res.status(400).json({
         error: 'No authorized transaction found',
-        transactions: transactions 
+        transactions: transactions,
       });
     }
-    
-    const result = await shopifyService.capturePayment(orderId, authTransaction.id);
-    
+
+    const result = await shopifyService.capturePayment(
+      orderId,
+      authTransaction.id
+    );
+
     res.json({
       success: true,
       message: 'Payment captured manually',
-      transaction: result
+      transaction: result,
     });
   } catch (error) {
     console.error('Manual capture error:', error);
@@ -190,7 +198,7 @@ app.get('/scheduled-jobs', (req, res) => {
   res.json({
     count: jobs.length,
     jobs: jobs,
-    timestamp: new Date().toISOString()
+    timestamp: new Date().toISOString(),
   });
 });
 
@@ -198,31 +206,33 @@ app.get('/scheduled-jobs', (req, res) => {
 app.post('/test-schedule/:orderId', async (req, res) => {
   try {
     const orderId = req.params.orderId;
-    const delay = req.query.delay || 120000; // Default 2 minutes
-    
-    console.log(`⏰ Manually scheduling capture for order ${orderId} in ${delay}ms`);
-    
-    const transactions = await shopifyService.getOrderTransactions(orderId);
-    const authTransaction = transactions.find(t => 
-      t.kind === 'authorization' && t.status === 'success'
+    const delay = parseInt(req.query.delay) || 120000; // Default 2 minutes
+
+    console.log(
+      `⏰ Manually scheduling capture for order ${orderId} in ${delay}ms`
     );
-    
+
+    const transactions = await shopifyService.getOrderTransactions(orderId);
+    const authTransaction = transactions.find(
+      (t) => t.kind === 'authorization' && t.status === 'success'
+    );
+
     if (!authTransaction) {
-      return res.status(400).json({ 
+      return res.status(400).json({
         error: 'No authorized transaction found',
-        transactions: transactions 
+        transactions: transactions,
       });
     }
-    
-    shopifyService.schedulePaymentCapture(orderId, authTransaction.id, parseInt(delay));
-    
+
+    shopifyService.schedulePaymentCapture(orderId, authTransaction.id, delay);
+
     const jobs = shopifyService.getScheduledJobs();
-    
+
     res.json({
       success: true,
       message: `Payment capture scheduled for order ${orderId}`,
       scheduledJobs: jobs,
-      captureIn: `${delay}ms`
+      captureIn: `${delay}ms`,
     });
   } catch (error) {
     console.error('Schedule test error:', error);
@@ -236,14 +246,19 @@ shopifyService.startScheduler();
 // Start server
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
-  console.log(`🏪 Shop: ${process.env.SHOPIFY_SHOP_NAME || 'Not configured'}`);
+  console.log(
+    `🏪 Shop: ${process.env.SHOPIFY_SHOP_NAME || 'Not configured'}`
+  );
   console.log(`🌍 Environment: ${process.env.NODE_ENV || 'development'}`);
   console.log(`📡 Health: http://localhost:${PORT}/health`);
   console.log(`📊 Status: http://localhost:${PORT}/status`);
-  
-  // Refresh access token on startup
-  shopifyService.refreshAccessToken().catch(error => {
-    console.error('Failed to refresh access token on startup:', error.message);
+
+  // Verify token on startup
+  shopifyService.refreshAccessToken().catch((error) => {
+    console.error(
+      'Failed to validate access token on startup:',
+      error.message
+    );
   });
 });
 
@@ -258,4 +273,4 @@ process.on('SIGINT', () => {
   process.exit(0);
 });
 
-module.exports = app; // For testing
+module.exports = app;

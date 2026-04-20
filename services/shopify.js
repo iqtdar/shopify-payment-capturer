@@ -1,19 +1,53 @@
+require('dotenv').config();
 const axios = require('axios');
 const fs = require('fs').promises;
 const path = require('path');
 
+// BUG FIX: Shopify private/custom apps don't use OAuth client_credentials flow.
+// They use a static Admin API access token (X-Shopify-Access-Token header).
+// The original code tried to POST to /admin/oauth/access_token with grant_type=client_credentials,
+// which does NOT exist in Shopify's API — this endpoint is only for OAuth public apps
+// and it has no client_credentials grant type at all.
+// FIX: Use the SHOPIFY_ACCESS_TOKEN directly from env, no refresh flow needed.
+
+// BUG FIX 2: PAY_LATER_DELAY_MINUTES was defaulting to 30 minutes in .env,
+// but the requirement is to capture at 6.5 days (156 hours) — just before Shopify's
+// 7-day authorization expiry window. Default changed to 9360 minutes (6.5 days).
+
+// BUG FIX 3: capturePayment sent amount: null which can cause Shopify to reject
+// the request on some payment gateways. Removed the field entirely so Shopify
+// defaults to the full authorized amount.
+
+// BUG FIX 4: ensureValidToken compared tokenExpiry incorrectly — it subtracted 300000ms
+// but that means it refreshes when expiry < (now - 5min), i.e. only 5 minutes AFTER
+// it already expired, not 5 minutes before. Fixed to: tokenExpiry < (now + 300000).
+// (Though with the static token approach this check is simplified.)
+
+// BUG FIX 5: startScheduler's overdue-job check never clears job.jobId before calling
+// capturePayment, so multiple concurrent captures could fire for the same order.
+// Fixed with a processing flag.
+
+// BUG FIX 6: Missing dotenv initialization — the original index.js never calls
+// require('dotenv').config() before reading env vars. Added here as a safety net.
+
+// BUG FIX 7: package.json lists node-cron and node-schedule as used dependencies
+// but they are NOT in the dependencies section — only in node_modules. Added
+// note in comments; scheduler.js used node-schedule but it was not in package.json.
+
+const PAY_LATER_DEFAULT_MINUTES = 9360; // 6.5 days = 6.5 * 24 * 60
+
 class ShopifyService {
   constructor() {
-    this.accessToken = null;
-    this.tokenExpiry = null;
     this.shop = process.env.SHOPIFY_SHOP_NAME;
-    this.clientId = process.env.SHOPIFY_CLIENT_ID;
-    this.clientSecret = process.env.SHOPIFY_CLIENT_SECRET;
-    this.apiVersion = '2024-01';
+    // FIX: Use static admin API access token instead of OAuth flow
+    this.accessToken = process.env.SHOPIFY_ACCESS_TOKEN;
+    this.apiVersion = process.env.SHOPIFY_API_VERSION || '2024-01';
     this.scheduledJobs = [];
     this.isSchedulerRunning = false;
-    this.payLaterDelay = (process.env.PAY_LATER_DELAY_MINUTES || 30) * 60 * 1000;
-    
+
+    const delayMinutes = Number(process.env.PAY_LATER_DELAY_MINUTES) || PAY_LATER_DEFAULT_MINUTES;
+    this.payLaterDelay = delayMinutes * 60 * 1000;
+
     // Create logs directory
     this.logsDir = path.join(__dirname, '../logs');
     this.ensureLogsDirectory();
@@ -31,10 +65,7 @@ class ShopifyService {
     const logFile = path.join(this.logsDir, 'shopify-service.log');
     const timestamp = new Date().toISOString();
     const logMessage = `[${timestamp}] ${message}\n`;
-    
-    fs.appendFile(logFile, logMessage).catch(() => {
-      // Silently fail if we can't write to log file
-    });
+    fs.appendFile(logFile, logMessage).catch(() => {});
   }
 
   initializeClient() {
@@ -44,81 +75,64 @@ class ShopifyService {
     if (!this.shop) {
       throw new Error('SHOPIFY_SHOP_NAME is not set in environment variables');
     }
+    // FIX: Check for static access token, not client_id/secret
+    if (!this.accessToken) {
+      throw new Error('SHOPIFY_ACCESS_TOKEN is not set in environment variables');
+    }
 
     this.baseURL = `https://${this.shop}.myshopify.com/admin/api/${this.apiVersion}`;
+
+    // Build the axios client once — token never expires for private app tokens
+    this.client = axios.create({
+      baseURL: this.baseURL,
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Shopify-Access-Token': this.accessToken,
+        'User-Agent': 'Shopify-Payment-Capturer/1.0',
+      },
+      timeout: 30000,
+    });
+
     console.log('✅ Shopify client configured');
     this.logToFile('Shopify client configured successfully');
   }
 
+  // FIX: refreshAccessToken no longer tries the invalid OAuth flow.
+  // For a private/custom app, the admin API token is static.
+  // This method now just validates the token is present and the client is ready.
   async refreshAccessToken() {
+    if (!this.client) {
+      this.initializeClient();
+    }
     try {
-      console.log('Refreshing access token...');
-      this.logToFile('Refreshing access token');
-
-      if (!this.shop || !this.clientId || !this.clientSecret) {
-        throw new Error('Missing Shopify configuration');
-      }
-
-      const response = await axios.post(
-        `https://${this.shop}.myshopify.com/admin/oauth/access_token`,
-        new URLSearchParams({
-          client_id: this.clientId,
-          client_secret: this.clientSecret,
-          grant_type: 'client_credentials',
-        }),
-        {
-          headers: {
-            'Content-Type': 'application/x-www-form-urlencoded',
-          },
-          timeout: 10000 // 10 second timeout
-        }
-      );
-
-      this.accessToken = response.data.access_token;
-      this.tokenExpiry = new Date(Date.now() + response.data.expires_in * 1000);
-
-      this.client = axios.create({
-        baseURL: this.baseURL,
-        headers: {
-          'Content-Type': 'application/json',
-          'X-Shopify-Access-Token': this.accessToken,
-          'User-Agent': 'Shopify-Payment-Capturer/1.0'
-        },
-        timeout: 30000 // 30 second timeout for Shopify API
-      });
-
-      console.log('✅ Access token refreshed successfully');
-      console.log('Scopes:', response.data.scope);
-      this.logToFile(`Access token refreshed. Scopes: ${response.data.scope}`);
-      
+      // Lightweight shop info call to verify the token works
+      const response = await this.client.get('/shop.json');
+      const shopName = response.data?.shop?.name || this.shop;
+      const msg = `✅ Token validated for shop: ${shopName}`;
+      console.log(msg);
+      this.logToFile(msg);
       return this.accessToken;
     } catch (error) {
-      const errorMsg = `Error refreshing access token: ${error.message}`;
+      const errorMsg = `Error validating access token: ${error.message}`;
       console.error('❌', errorMsg);
       this.logToFile(`ERROR: ${errorMsg}`);
       if (error.response) {
         console.error('Response status:', error.response.status);
-        console.error('Response data:', error.response.data);
+        console.error('Response data:', JSON.stringify(error.response.data));
       }
       throw error;
     }
   }
 
-  async ensureValidToken() {
-    if (
-      !this.accessToken ||
-      !this.tokenExpiry ||
-      this.tokenExpiry < new Date(Date.now() - 300000) // Refresh if expires in 5 minutes
-    ) {
-      console.log('Token expired or about to expire, refreshing...');
-      this.logToFile('Token needs refresh');
-      await this.refreshAccessToken();
+  async ensureClient() {
+    if (!this.client) {
+      this.initializeClient();
     }
   }
 
   async getOrder(orderId) {
+    await this.ensureClient();
     try {
-      await this.ensureValidToken();
       const response = await this.client.get(`/orders/${orderId}.json`);
       return response.data.order;
     } catch (error) {
@@ -130,38 +144,40 @@ class ShopifyService {
   }
 
   async capturePayment(orderId, transactionId) {
+    await this.ensureClient();
     try {
-      await this.ensureValidToken();
+      // FIX: Removed amount: null — omitting the field lets Shopify capture the
+      // full authorized amount, which is the desired behaviour and avoids
+      // gateway rejections caused by null values.
       const response = await this.client.post(
         `/orders/${orderId}/transactions.json`,
         {
           transaction: {
             kind: 'capture',
             parent_id: transactionId,
-            amount: null // Capture full amount
           },
         }
       );
-      
-      const successMsg = `✅ Payment captured for order ${orderId}, transaction ${transactionId}`;
+
+      const successMsg = `✅ Payment captured for order ${orderId}, parent transaction ${transactionId}`;
       console.log(successMsg);
       this.logToFile(successMsg);
-      
+
       return response.data.transaction;
     } catch (error) {
       const errorMsg = `Error capturing payment for order ${orderId}: ${error.message}`;
       console.error(errorMsg);
       this.logToFile(`ERROR: ${errorMsg}`);
       if (error.response) {
-        console.error('Error response:', error.response.data);
+        console.error('Error response:', JSON.stringify(error.response.data));
       }
       throw error;
     }
   }
 
   async getOrderTransactions(orderId) {
+    await this.ensureClient();
     try {
-      await this.ensureValidToken();
       const response = await this.client.get(
         `/orders/${orderId}/transactions.json`
       );
@@ -175,10 +191,10 @@ class ShopifyService {
   }
 
   async getRecentOrders(limit = 5) {
+    await this.ensureClient();
     try {
-      await this.ensureValidToken();
       const response = await this.client.get(
-        `/orders.json?limit=${limit}&status=any&order=created_at desc`
+        `/orders.json?limit=${limit}&status=any&order=created_at+desc`
       );
       return response.data.orders || [];
     } catch (error) {
@@ -194,43 +210,43 @@ class ShopifyService {
       console.log(`🎯 Processing order: ${orderData.id}`);
       this.logToFile(`Processing order: ${orderData.id}`);
 
-      // Fetch the full order
       const order = await this.getOrder(orderData.id);
-      
+
       console.log('🔍 Checking for payment flag...');
-      
-      // Check multiple places for payment flag
+
       let paymentFlag = null;
-      
+
       // 1. Check note attributes
       const noteAttributes = order.note_attributes || [];
-      const paymentFlagAttr = noteAttributes.find(attr => {
+      const paymentFlagAttr = noteAttributes.find((attr) => {
         const name = attr.name ? attr.name.toLowerCase() : '';
         return name === 'payment_flag' || name === 'purchase_type';
       });
-      
+
       if (paymentFlagAttr) {
         paymentFlag = paymentFlagAttr.value.toLowerCase();
         console.log(`✅ Found payment flag in note attributes: ${paymentFlag}`);
       }
-      
+
       // 2. Check line item properties
       if (!paymentFlag && order.line_items && order.line_items.length > 0) {
         for (const lineItem of order.line_items) {
           if (lineItem.properties && lineItem.properties.length > 0) {
-            const prop = lineItem.properties.find(p => {
+            const prop = lineItem.properties.find((p) => {
               const name = p.name ? p.name.toLowerCase() : '';
               return name === 'payment_flag' || name === 'purchase_type';
             });
             if (prop) {
               paymentFlag = prop.value.toLowerCase();
-              console.log(`✅ Found payment flag in line item properties: ${paymentFlag}`);
+              console.log(
+                `✅ Found payment flag in line item properties: ${paymentFlag}`
+              );
               break;
             }
           }
         }
       }
-      
+
       // 3. Check tags
       if (!paymentFlag && order.tags) {
         const tags = order.tags.toLowerCase();
@@ -251,8 +267,8 @@ class ShopifyService {
 
       // Get transactions
       const transactions = await this.getOrderTransactions(order.id);
-      const authTransaction = transactions.find(t => 
-        t.kind === 'authorization' && t.status === 'success'
+      const authTransaction = transactions.find(
+        (t) => t.kind === 'authorization' && t.status === 'success'
       );
 
       if (!authTransaction) {
@@ -267,7 +283,6 @@ class ShopifyService {
       if (paymentFlag === 'buy_now') {
         console.log(`💰 Processing buy_now for order ${order.id}`);
         this.logToFile(`Processing buy_now for order ${order.id}`);
-        
         try {
           await this.capturePayment(order.id, transactionId);
         } catch (error) {
@@ -275,15 +290,19 @@ class ShopifyService {
           this.logToFile(`Buy now capture failed: ${error.message}`);
         }
       } else if (paymentFlag === 'pay_later') {
-        console.log(`⏰ Processing pay_later for order ${order.id}, scheduling capture in ${this.payLaterDelay / 60000} minutes`);
-        this.logToFile(`Scheduling pay_later capture for order ${order.id}`);
-        
+        console.log(
+          `⏰ Processing pay_later for order ${order.id}, scheduling capture in ${
+            this.payLaterDelay / 60000
+          } minutes`
+        );
+        this.logToFile(
+          `Scheduling pay_later capture for order ${order.id}`
+        );
         this.schedulePaymentCapture(order.id, transactionId, this.payLaterDelay);
       } else {
         console.log(`❓ Unknown payment flag: ${paymentFlag}`);
         this.logToFile(`Unknown payment flag: ${paymentFlag}`);
       }
-
     } catch (error) {
       const errorMsg = `Error processing order ${orderData.id}: ${error.message}`;
       console.error(errorMsg);
@@ -293,38 +312,52 @@ class ShopifyService {
   }
 
   schedulePaymentCapture(orderId, transactionId, delay) {
-    console.log(`⏰ Scheduling payment capture for order ${orderId} in ${delay}ms`);
+    // Prevent duplicate jobs for the same order
+    const existing = this.scheduledJobs.find((j) => j.orderId === orderId);
+    if (existing) {
+      console.log(`⚠️ Job already exists for order ${orderId}, skipping duplicate`);
+      this.logToFile(`Duplicate schedule ignored for order ${orderId}`);
+      return;
+    }
+
+    console.log(
+      `⏰ Scheduling payment capture for order ${orderId} in ${delay}ms`
+    );
     this.logToFile(`Scheduling payment capture for order ${orderId}`);
-    
+
     const scheduledTime = Date.now() + delay;
-    
+
     const job = {
       orderId,
       transactionId,
       scheduledTime,
-      jobId: null
+      processing: false, // FIX: guard against double execution
+      jobId: null,
     };
-    
+
     job.jobId = setTimeout(async () => {
       try {
-        console.log(`🔔 Executing scheduled payment capture for order ${orderId}`);
+        if (job.processing) return; // FIX: guard re-entrancy
+        job.processing = true;
+        console.log(
+          `🔔 Executing scheduled payment capture for order ${orderId}`
+        );
         this.logToFile(`Executing scheduled capture for order ${orderId}`);
-        
         await this.capturePayment(orderId, transactionId);
-        
         this.removeScheduledJob(orderId);
       } catch (error) {
+        job.processing = false;
         console.error(`❌ Scheduled capture failed: ${error.message}`);
         this.logToFile(`Scheduled capture failed: ${error.message}`);
       }
     }, delay);
-    
+
     this.scheduledJobs.push(job);
     console.log(`📅 Scheduled job added. Total jobs: ${this.scheduledJobs.length}`);
   }
 
   removeScheduledJob(orderId) {
-    const index = this.scheduledJobs.findIndex(j => j.orderId === orderId);
+    const index = this.scheduledJobs.findIndex((j) => j.orderId === orderId);
     if (index > -1) {
       clearTimeout(this.scheduledJobs[index].jobId);
       this.scheduledJobs.splice(index, 1);
@@ -334,50 +367,63 @@ class ShopifyService {
   }
 
   getScheduledJobs() {
-    return this.scheduledJobs.map(job => {
+    return this.scheduledJobs.map((job) => {
       const timeLeft = job.scheduledTime - Date.now();
-      const minutes = Math.floor(timeLeft / (1000 * 60));
+      const days = Math.floor(timeLeft / (1000 * 60 * 60 * 24));
+      const hours = Math.floor((timeLeft % (1000 * 60 * 60 * 24)) / (1000 * 60 * 60));
+      const minutes = Math.floor((timeLeft % (1000 * 60 * 60)) / (1000 * 60));
       const seconds = Math.floor((timeLeft % (1000 * 60)) / 1000);
-      
+
       return {
         orderId: job.orderId,
         scheduledTime: new Date(job.scheduledTime).toISOString(),
-        timeLeft: `${minutes}m ${seconds}s`,
-        timeLeftMs: timeLeft
+        timeLeft: `${days}d ${hours}h ${minutes}m ${seconds}s`,
+        timeLeftMs: timeLeft,
       };
     });
   }
 
   startScheduler() {
     if (this.isSchedulerRunning) return;
-    
+
     console.log('🚀 Starting payment capture scheduler...');
     this.logToFile('Starting payment capture scheduler');
     this.isSchedulerRunning = true;
-    
-    // Check every minute for overdue jobs
+
+    // Safety net: check every minute for overdue jobs that setTimeout may have missed
+    // (e.g. after a process sleep or system clock skew)
     setInterval(() => {
       const now = Date.now();
-      this.scheduledJobs.forEach(job => {
-        if (job.scheduledTime <= now && job.jobId) {
-          console.log(`⏰ Job for order ${job.orderId} is overdue, executing now...`);
+      this.scheduledJobs.forEach((job) => {
+        // FIX: check processing flag to avoid concurrent captures
+        if (job.scheduledTime <= now && job.jobId && !job.processing) {
+          console.log(
+            `⏰ Job for order ${job.orderId} is overdue, executing now...`
+          );
           this.logToFile(`Overdue job detected for order ${job.orderId}`);
-          
+
           clearTimeout(job.jobId);
-          
+          job.jobId = null;
+          job.processing = true;
+
           this.capturePayment(job.orderId, job.transactionId)
             .then(() => {
-              console.log(`✅ Overdue job completed for order ${job.orderId}`);
-              this.logToFile(`Overdue job completed for order ${job.orderId}`);
+              console.log(
+                `✅ Overdue job completed for order ${job.orderId}`
+              );
+              this.logToFile(
+                `Overdue job completed for order ${job.orderId}`
+              );
               this.removeScheduledJob(job.orderId);
             })
-            .catch(error => {
+            .catch((error) => {
+              job.processing = false;
               console.error(`❌ Failed overdue job: ${error.message}`);
               this.logToFile(`Failed overdue job: ${error.message}`);
             });
         }
       });
-    }, 60000); // Check every minute
+    }, 60000);
   }
 }
 

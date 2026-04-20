@@ -1,12 +1,65 @@
-# render.yaml
+# render.yaml — Render Blueprint (Infrastructure as Code)
+# Render Professional Plan
+# Deploy by connecting your GitHub repo and pointing Render at this file,
+# OR by using the Render CLI: render blueprint apply
+#
+# Docs: https://render.com/docs/blueprint-spec
+
 services:
   - type: web
     name: shopify-payment-capturer
-    env: node
-    buildCommand: npm install
-    startCommand: npm start
+    runtime: node
+    region: oregon           # options: oregon, frankfurt, singapore, ohio, virginia
+    plan: starter            # Professional plan options: starter, standard, pro
+                             # starter = 512MB RAM / 0.5 CPU — enough for this app
+                             # upgrade to standard (2GB) if you schedule many jobs
+
+    # Build & start
+    buildCommand: npm install --omit=dev
+    startCommand: node index.js
+
+    # Auto-deploy from the connected Git branch
+    autoDeploy: true
+    branch: main             # change if your primary branch is master or another name
+
+    # Health check — Render will restart the service if this fails
+    healthCheckPath: /health
+
+    # Keep the service alive between requests (important — this app runs a scheduler)
+    # Professional plan supports "always on" — no spinning down to zero
+    # This is the key difference from the free plan for a scheduler app.
+
+    # Environment variables
+    # Set SECRET values in the Render dashboard (not here) — this file is committed to Git.
+    # Only non-secret defaults live here.
     envVars:
       - key: NODE_ENV
         value: production
-    healthCheckPath: /health
-    autoDeploy: true
+
+      - key: PORT
+        value: 10000          # Render always binds to 10000 internally; it rewrites PORT
+
+      - key: PAY_LATER_DELAY_MINUTES
+        value: "9360"          # 6.5 days — just before Shopify's 7-day auth expiry
+
+      - key: SHOPIFY_API_VERSION
+        value: "2024-01"
+
+      # ── Secrets: set these in the Render Dashboard > Environment ──────────
+      # DO NOT add real values here — this file is in Git.
+      #
+      # - key: SHOPIFY_SHOP_NAME
+      #   sync: false          # means Render won't expose it in logs
+      #
+      # - key: SHOPIFY_ACCESS_TOKEN
+      #   sync: false
+      #
+      # - key: SHOPIFY_WEBHOOK_SECRET
+      #   sync: false
+
+    # Disk for persistent logs (optional — Render ephemeral filesystem resets on deploy)
+    # Uncomment if you want logs to survive deploys (Professional plan supports disks)
+    # disk:
+    #   name: app-logs
+    #   mountPath: /opt/render/project/src/logs
+    #   sizeGB: 1
