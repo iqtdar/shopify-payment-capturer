@@ -12,7 +12,17 @@ const PAY_LATER_DEFAULT_MINUTES = 9360; // 6.5 days — just before Shopify's 7-
 
 class ShopifyService {
   constructor() {
-    this.shop = process.env.SHOPIFY_SHOP;
+    // Sanitize shop name — accept any of these and normalize to just "my-store":
+    //   my-store
+    //   my-store.myshopify.com
+    //   https://my-store.myshopify.com
+    //   https://my-store.myshopify.com/
+    const rawShop = (process.env.SHOPIFY_SHOP || '').trim();
+    this.shop = rawShop
+      .replace(/^https?:\/\//i, '')   // strip protocol
+      .replace(/\/+$/, '')            // strip trailing slash
+      .replace(/\.myshopify\.com.*$/i, ''); // strip .myshopify.com and anything after
+
     this.clientId = process.env.SHOPIFY_CLIENT_ID;
     this.clientSecret = process.env.SHOPIFY_CLIENT_SECRET;
     this.apiVersion = process.env.SHOPIFY_API_VERSION || '2024-01';
