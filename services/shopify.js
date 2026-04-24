@@ -135,11 +135,20 @@ class ShopifyService {
     } catch (error) {
       const msg = `Error obtaining/validating token: ${error.message}`;
       console.error('❌', msg);
-      this.logToFile(`ERROR: ${msg}`);
-      if (error.response) {
-        console.error('Status:', error.response.status);
-        console.error('Body:', JSON.stringify(error.response.data));
+      // Log full error chain to expose the real root cause
+      if (error.cause) {
+        console.error('  Caused by:', error.cause?.message || String(error.cause));
+        if (error.cause?.cause) {
+          console.error('  Root cause:', error.cause.cause?.message || String(error.cause.cause));
+        }
       }
+      console.error('  Error code:', error.code);
+      console.error('  Error type:', error.constructor?.name);
+      if (error.response) {
+        console.error('  HTTP status:', error.response.status);
+        console.error('  HTTP body:', JSON.stringify(error.response.data));
+      }
+      this.logToFile(`ERROR: ${msg}`);
       throw error;
     }
   }
