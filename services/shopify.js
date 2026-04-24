@@ -48,20 +48,40 @@ class ShopifyService {
   // Fetch a fresh access token using the client_credentials grant.
   async fetchNewToken() {
     const url = `https://${this.shop}.myshopify.com/admin/oauth/access_token`;
-    const params = new URLSearchParams({
+
+    // Use native fetch (built into Node 18+) instead of axios for the token request.
+    // Render's outbound proxy injects an intermediate certificate that axios rejects
+    // with "certificate has expired". Node's native fetch uses the system TLS stack
+    // which trusts the proxy CA correctly.
+    const body = new URLSearchParams({
       grant_type: 'client_credentials',
       client_id: this.clientId,
       client_secret: this.clientSecret,
     });
 
-    const response = await axios.post(url, params.toString(), {
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      timeout: 15000,
-    });
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 15000);
 
-    const { access_token, expires_in } = response.data;
+    let response;
+    try {
+      response = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: body.toString(),
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timeout);
+    }
+
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(`Token request failed: ${response.status} ${text}`);
+    }
+
+    const { access_token, expires_in } = await response.json();
     this.token = access_token;
-    // FIX: original bug refreshed 5 min AFTER expiry; correct is 60s BEFORE
+    // expires_in is in seconds; refresh 60s before expiry
     this.tokenExpiresAt = Date.now() + expires_in * 1000;
 
     const msg = `✅ New access token obtained (expires in ${expires_in}s)`;
