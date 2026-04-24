@@ -28,7 +28,7 @@ app.get('/health', (req, res) => {
   res.json({
     status: 'healthy',
     timestamp: new Date().toISOString(),
-    shop: process.env.SHOPIFY_SHOP_NAME,
+    shop: process.env.SHOPIFY_SHOP,
     uptime: process.uptime(),
     memory: process.memoryUsage(),
     node: process.version,
@@ -68,7 +68,7 @@ app.get('/status', (req, res) => {
       <div class="stats">
         <p><strong>Uptime:</strong> ${Math.floor(process.uptime())} seconds</p>
         <p><strong>Node Version:</strong> ${process.version}</p>
-        <p><strong>Shop:</strong> ${process.env.SHOPIFY_SHOP_NAME || 'Not configured'}</p>
+        <p><strong>Shop:</strong> ${process.env.SHOPIFY_SHOP || 'Not configured'}</p>
         <p><strong>Environment:</strong> ${process.env.NODE_ENV || 'development'}</p>
         <p><strong>Port:</strong> ${PORT}</p>
       </div>
@@ -97,7 +97,7 @@ app.get('/test/shop', async (req, res) => {
   try {
     await shopifyService.refreshAccessToken();
     res.json({
-      shop: process.env.SHOPIFY_SHOP_NAME,
+      shop: process.env.SHOPIFY_SHOP,
       connected: true,
       timestamp: new Date().toISOString(),
     });
@@ -247,7 +247,7 @@ shopifyService.startScheduler();
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
   console.log(
-    `🏪 Shop: ${process.env.SHOPIFY_SHOP_NAME || 'Not configured'}`
+    `🏪 Shop: ${process.env.SHOPIFY_SHOP || 'Not configured'}`
   );
   console.log(`🌍 Environment: ${process.env.NODE_ENV || 'development'}`);
   console.log(`📡 Health: http://localhost:${PORT}/health`);
